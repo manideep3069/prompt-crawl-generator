@@ -1,5 +1,4 @@
 streamlit
-playwright
 beautifulsoup4
 lxml
 tldextract
@@ -9,3 +8,4 @@ google-generativeai
 python-dotenv
 pandas
 tqdm
+httpx

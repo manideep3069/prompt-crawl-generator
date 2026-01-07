@@ -1,30 +1,31 @@
 """
-Web Crawler using Crawl4AI ONLY
+Web Crawler for Streamlit Cloud (No Browser Required)
 
-Uses crawl4ai's native AsyncWebCrawler for:
-- LLM-optimized markdown output
-- Async multi-page crawling
-- Built-in content extraction
-- Link discovery
+Uses requests + BeautifulSoup for cloud-compatible crawling.
+No Playwright or headless browsers needed.
 """
 from __future__ import annotations
 
-import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Set
 from urllib.parse import urljoin, urlparse
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 from bs4 import BeautifulSoup
 import tldextract
 
 try:
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
-    CRAWL4AI_OK = True
+    import httpx
+    HTTPX_OK = True
 except ImportError:
-    CRAWL4AI_OK = False
-    AsyncWebCrawler = None
+    HTTPX_OK = False
+
+# Cloud-compatible - always true
+CRAWL4AI_OK = True
 
 
 # =============================================================================
@@ -77,6 +78,12 @@ class SiteContext:
 # Utilities
 # =============================================================================
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 def ensure_http(url: str) -> str:
     url = (url or "").strip()
     if not url:
@@ -94,6 +101,14 @@ def clean_text(s: str) -> str:
 
 def same_site(base: str, u: str) -> bool:
     return get_domain(base) == get_domain(u)
+
+def fetch_page(url: str, timeout: int = 15) -> tuple[str, int]:
+    """Fetch a page and return (html, status_code)."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        return resp.text, resp.status_code
+    except Exception:
+        return "", 0
 
 STOP_NAV_WORDS = {
     "home", "menu", "search", "account", "profile", "sign in", "log in", "login",
@@ -169,8 +184,7 @@ def detect_features(text: str) -> Dict[str, bool]:
     }
 
 
-def extract_nav_sections(html: str) -> List[str]:
-    soup = BeautifulSoup(html, "lxml")
+def extract_nav_sections(soup: BeautifulSoup) -> List[str]:
     sections = []
     
     for nav in soup.select("nav, header, [role='navigation']"):
@@ -183,8 +197,7 @@ def extract_nav_sections(html: str) -> List[str]:
     return sections[:20]
 
 
-def extract_categories(html: str) -> tuple[List[str], Dict[str, List[str]]]:
-    soup = BeautifulSoup(html, "lxml")
+def extract_categories(soup: BeautifulSoup) -> tuple[List[str], Dict[str, List[str]]]:
     categories = []
     subcategories = {}
     
@@ -211,8 +224,7 @@ def extract_categories(html: str) -> tuple[List[str], Dict[str, List[str]]]:
     return categories[:15], subcategories
 
 
-def extract_filters(html: str) -> tuple[List[str], Dict[str, List[str]]]:
-    soup = BeautifulSoup(html, "lxml")
+def extract_filters(soup: BeautifulSoup) -> tuple[List[str], Dict[str, List[str]]]:
     filter_types = []
     filter_values = {}
     
@@ -244,8 +256,7 @@ def extract_filters(html: str) -> tuple[List[str], Dict[str, List[str]]]:
     return filter_types, filter_values
 
 
-def extract_products_from_html(html: str) -> List[str]:
-    soup = BeautifulSoup(html, "lxml")
+def extract_products(soup: BeautifulSoup) -> List[str]:
     products = []
     
     for product in soup.select("[class*='product'], [class*='item'], article, [data-testid*='product']"):
@@ -258,41 +269,20 @@ def extract_products_from_html(html: str) -> List[str]:
     return products[:25]
 
 
-def extract_products_from_markdown(markdown: str) -> List[str]:
-    products = []
+def extract_links(soup: BeautifulSoup, base_url: str) -> List[str]:
+    """Extract internal links."""
+    links = []
     
-    # Links with product-like text
-    link_pattern = re.compile(r'\[([^\]]{10,60})\]\([^\)]+\)')
-    for match in link_pattern.finditer(markdown):
-        text = match.group(1).strip()
-        if not any(w in text.lower() for w in ["click", "view", "see all", "read more"]):
-            if text not in products:
-                products.append(text)
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if href and not href.startswith(("#", "javascript:", "mailto:")):
+            full_url = urljoin(base_url, href)
+            if same_site(base_url, full_url):
+                if not re.search(r'\.(jpg|png|gif|css|js|pdf)(\?|$)', full_url, re.I):
+                    if full_url not in links:
+                        links.append(full_url)
     
-    return products[:20]
-
-
-def extract_internal_links(links_dict: Dict, base_url: str) -> List[str]:
-    """Extract internal links from crawl4ai's links dict."""
-    internal = []
-    
-    if not links_dict:
-        return internal
-    
-    internal_links = links_dict.get("internal", {})
-    if isinstance(internal_links, dict):
-        for href in internal_links.keys():
-            if same_site(base_url, href):
-                if not re.search(r'\.(jpg|png|gif|css|js|pdf)(\?|$)', href, re.I):
-                    internal.append(href)
-    elif isinstance(internal_links, list):
-        for item in internal_links:
-            href = item if isinstance(item, str) else item.get("href", "")
-            if href and same_site(base_url, href):
-                if not re.search(r'\.(jpg|png|gif|css|js|pdf)(\?|$)', href, re.I):
-                    internal.append(href)
-    
-    return internal[:50]
+    return links[:50]
 
 
 def classify_page_type(url: str) -> str:
@@ -317,40 +307,27 @@ def classify_page_type(url: str) -> str:
 
 
 # =============================================================================
-# Crawl4AI Crawler
+# Cloud-Compatible Crawler
 # =============================================================================
 
 class Crawl4AICrawler:
     """
-    Multi-page crawler using only Crawl4AI.
-    
-    Features:
-    - Crawls minimum 5 pages
-    - LLM-optimized markdown output
-    - Smart link prioritization
-    - Content extraction from all pages
+    Cloud-compatible crawler using requests + BeautifulSoup.
+    Works on Streamlit Cloud without browser installation.
     """
     
     def __init__(
         self,
         max_pages: int = 15,
         min_pages: int = 5,
-        headless: bool = True,
-        timeout_ms: int = 30000
+        headless: bool = True,  # Ignored, for compatibility
+        timeout_ms: int = 15000
     ):
         self.max_pages = max(max_pages, min_pages)
         self.min_pages = min_pages
-        self.headless = headless
-        self.timeout_ms = timeout_ms
+        self.timeout = timeout_ms // 1000
     
     def crawl(self, url: str, progress_callback=None) -> SiteContext:
-        """Synchronous wrapper."""
-        return asyncio.run(self._crawl_async(url, progress_callback))
-    
-    async def _crawl_async(self, url: str, progress_callback=None) -> SiteContext:
-        if not CRAWL4AI_OK:
-            raise RuntimeError("crawl4ai not installed. Run: pip install crawl4ai")
-        
         url = ensure_http(url)
         domain = get_domain(url)
         
@@ -361,182 +338,153 @@ class Crawl4AICrawler:
             if progress_callback:
                 progress_callback(msg)
         
-        log(f"Starting Crawl4AI crawl of {url}")
+        log(f"Starting crawl of {url}")
         log(f"Target: min {self.min_pages} pages, max {self.max_pages} pages")
-        
-        # Configure browser
-        browser_config = BrowserConfig(
-            headless=self.headless,
-            viewport_width=1280,
-            viewport_height=900,
-        )
-        
-        # Crawler config
-        crawler_config = CrawlerRunConfig(
-            cache_mode=CacheMode.BYPASS,
-            page_timeout=self.timeout_ms,
-            wait_until="domcontentloaded",
-        )
         
         visited: Set[str] = set()
         to_visit: List[str] = []
         
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            # === Crawl homepage ===
-            log("Phase 1: Crawling homepage...")
+        # === Crawl homepage ===
+        log("Phase 1: Fetching homepage...")
+        
+        html, status = fetch_page(url, self.timeout)
+        
+        if status == 200 and html:
+            ctx.pages_crawled += 1
+            ctx.page_types_found["homepage"] = 1
+            visited.add(url)
             
-            try:
-                result = await crawler.arun(url, config=crawler_config)
+            soup = BeautifulSoup(html, "lxml")
+            text = clean_text(soup.get_text(" "))
+            
+            # Title and description
+            ctx.title = soup.title.get_text() if soup.title else ""
+            meta_desc = soup.find("meta", attrs={"name": "description"})
+            ctx.description = meta_desc.get("content", "")[:300] if meta_desc else ""
+            
+            # Site type and vocabulary
+            ctx.site_type = detect_site_type(url, text)
+            log(f"  Site type: {ctx.site_type}")
+            
+            vocab = detect_vocabulary(text)
+            ctx.currency = vocab["currency"]
+            ctx.cart_word = vocab["cart_word"]
+            ctx.add_phrase = vocab["add_phrase"]
+            ctx.signin_word = vocab["signin_word"]
+            
+            # Features
+            features = detect_features(text)
+            ctx.has_search = features["has_search"]
+            ctx.has_checkout = features["has_checkout"]
+            ctx.has_account = features["has_account"]
+            ctx.has_wishlist = features["has_wishlist"]
+            ctx.guest_checkout = features["guest_checkout"]
+            
+            # Navigation
+            ctx.main_sections = extract_nav_sections(soup)
+            log(f"  Found {len(ctx.main_sections)} nav sections")
+            
+            # Categories
+            cats, subcats = extract_categories(soup)
+            ctx.categories = cats
+            ctx.subcategories = subcats
+            
+            # Products
+            ctx.sample_products = extract_products(soup)
+            
+            # Links for Phase 2
+            to_visit = extract_links(soup, url)
+            log(f"  Found {len(to_visit)} internal links")
+        else:
+            log(f"  Homepage fetch failed (status: {status})")
+        
+        # === Crawl additional pages ===
+        if to_visit:
+            log(f"Phase 2: Crawling additional pages...")
+            
+            # Prioritize interesting pages
+            priority = []
+            normal = []
+            for link in to_visit:
+                if link not in visited:
+                    if any(re.search(p, link, re.I) for p in PRIORITY_PATTERNS):
+                        priority.append(link)
+                    else:
+                        normal.append(link)
+            
+            queue = priority[:15] + normal[:10]
+            
+            for link in queue:
+                if ctx.pages_crawled >= self.max_pages:
+                    break
+                if link in visited:
+                    continue
                 
-                if result.success:
+                visited.add(link)
+                
+                html, status = fetch_page(link, self.timeout)
+                
+                if status == 200 and html:
                     ctx.pages_crawled += 1
-                    ctx.page_types_found["homepage"] = 1
-                    visited.add(url)
+                    ptype = classify_page_type(link)
+                    ctx.page_types_found[ptype] = ctx.page_types_found.get(ptype, 0) + 1
                     
-                    # Extract metadata
-                    if result.metadata:
-                        ctx.title = result.metadata.get("title", "")
-                        ctx.description = result.metadata.get("description", "")[:300]
+                    log(f"  [{ctx.pages_crawled}] {ptype}: {link[:50]}...")
                     
-                    # Get text content
-                    text = result.markdown or result.cleaned_html or ""
-                    html = result.html or ""
-                    ctx.markdown_content = text[:10000]
+                    soup = BeautifulSoup(html, "lxml")
                     
-                    # Detect site type and vocabulary
-                    ctx.site_type = detect_site_type(url, text)
-                    log(f"  Site type: {ctx.site_type}")
+                    # Extract more content
+                    if ptype in ["category", "search"]:
+                        ftypes, fvals = extract_filters(soup)
+                        for ft in ftypes:
+                            if ft not in ctx.filter_types:
+                                ctx.filter_types.append(ft)
+                        for k, v in fvals.items():
+                            if k not in ctx.filter_values:
+                                ctx.filter_values[k] = []
+                            ctx.filter_values[k].extend([x for x in v if x not in ctx.filter_values[k]])
                     
-                    vocab = detect_vocabulary(text)
-                    ctx.currency = vocab["currency"]
-                    ctx.cart_word = vocab["cart_word"]
-                    ctx.add_phrase = vocab["add_phrase"]
-                    ctx.signin_word = vocab["signin_word"]
+                    # More products
+                    products = extract_products(soup)
+                    for p in products:
+                        if p not in ctx.sample_products and len(ctx.sample_products) < 30:
+                            ctx.sample_products.append(p)
                     
-                    # Detect features
-                    features = detect_features(text)
-                    ctx.has_search = features["has_search"]
-                    ctx.has_checkout = features["has_checkout"]
-                    ctx.has_account = features["has_account"]
-                    ctx.has_wishlist = features["has_wishlist"]
-                    ctx.guest_checkout = features["guest_checkout"]
+                    # More categories
+                    more_cats, more_subs = extract_categories(soup)
+                    for c in more_cats:
+                        if c not in ctx.categories:
+                            ctx.categories.append(c)
+                    ctx.subcategories.update(more_subs)
                     
-                    # Extract navigation
-                    ctx.main_sections = extract_nav_sections(html)
-                    log(f"  Found {len(ctx.main_sections)} nav sections")
-                    
-                    # Extract categories
-                    cats, subcats = extract_categories(html)
-                    ctx.categories = cats
-                    ctx.subcategories = subcats
-                    
-                    # Extract products
-                    products = extract_products_from_html(html)
-                    products += extract_products_from_markdown(text)
-                    ctx.sample_products = list(dict.fromkeys(products))[:25]
-                    
-                    # Get internal links for Phase 2
-                    if result.links:
-                        to_visit = extract_internal_links(result.links, url)
-                        log(f"  Found {len(to_visit)} internal links")
-                else:
-                    log(f"  Homepage failed: {result.error_message}")
-            
-            except Exception as e:
-                log(f"  Homepage error: {e}")
-            
-            # === Crawl additional pages ===
-            if to_visit:
-                log(f"Phase 2: Crawling additional pages...")
+                    # More links
+                    new_links = extract_links(soup, url)
+                    for nl in new_links:
+                        if nl not in visited and nl not in queue:
+                            queue.append(nl)
                 
-                # Prioritize interesting pages
-                priority = []
-                normal = []
-                for link in to_visit:
-                    if link not in visited:
-                        if any(re.search(p, link, re.I) for p in PRIORITY_PATTERNS):
-                            priority.append(link)
-                        else:
-                            normal.append(link)
-                
-                queue = priority[:20] + normal[:10]
+                time.sleep(0.3)  # Be polite
+            
+            # === Ensure minimum pages ===
+            if ctx.pages_crawled < self.min_pages and queue:
+                log(f"Phase 3: Need {self.min_pages - ctx.pages_crawled} more pages...")
                 
                 for link in queue:
-                    if ctx.pages_crawled >= self.max_pages:
+                    if ctx.pages_crawled >= self.min_pages:
                         break
                     if link in visited:
                         continue
                     
                     visited.add(link)
+                    html, status = fetch_page(link, self.timeout)
                     
-                    try:
-                        result = await crawler.arun(link, config=crawler_config)
-                        
-                        if result.success:
-                            ctx.pages_crawled += 1
-                            ptype = classify_page_type(link)
-                            ctx.page_types_found[ptype] = ctx.page_types_found.get(ptype, 0) + 1
-                            
-                            log(f"  [{ctx.pages_crawled}] {ptype}: {link[:50]}...")
-                            
-                            html = result.html or ""
-                            text = result.markdown or ""
-                            
-                            # Extract more content from this page
-                            if ptype in ["category", "search"]:
-                                ftypes, fvals = extract_filters(html)
-                                for ft in ftypes:
-                                    if ft not in ctx.filter_types:
-                                        ctx.filter_types.append(ft)
-                                for k, v in fvals.items():
-                                    if k not in ctx.filter_values:
-                                        ctx.filter_values[k] = []
-                                    ctx.filter_values[k].extend([x for x in v if x not in ctx.filter_values[k]])
-                            
-                            # More products
-                            products = extract_products_from_html(html)
-                            products += extract_products_from_markdown(text)
-                            for p in products:
-                                if p not in ctx.sample_products and len(ctx.sample_products) < 30:
-                                    ctx.sample_products.append(p)
-                            
-                            # More categories
-                            more_cats, more_subs = extract_categories(html)
-                            for c in more_cats:
-                                if c not in ctx.categories:
-                                    ctx.categories.append(c)
-                            ctx.subcategories.update(more_subs)
-                            
-                            # More links
-                            if result.links:
-                                new_links = extract_internal_links(result.links, url)
-                                for nl in new_links:
-                                    if nl not in visited and nl not in queue:
-                                        queue.append(nl)
+                    if status == 200 and html:
+                        ctx.pages_crawled += 1
+                        ptype = classify_page_type(link)
+                        ctx.page_types_found[ptype] = ctx.page_types_found.get(ptype, 0) + 1
+                        log(f"  [{ctx.pages_crawled}] {ptype}: {link[:50]}...")
                     
-                    except Exception as e:
-                        log(f"  Error: {link[:40]}: {e}")
-                
-                # === Ensure minimum pages ===
-                if ctx.pages_crawled < self.min_pages and queue:
-                    log(f"Phase 3: Need {self.min_pages - ctx.pages_crawled} more pages...")
-                    
-                    for link in queue:
-                        if ctx.pages_crawled >= self.min_pages:
-                            break
-                        if link in visited:
-                            continue
-                        
-                        visited.add(link)
-                        try:
-                            result = await crawler.arun(link, config=crawler_config)
-                            if result.success:
-                                ctx.pages_crawled += 1
-                                ptype = classify_page_type(link)
-                                ctx.page_types_found[ptype] = ctx.page_types_found.get(ptype, 0) + 1
-                                log(f"  [{ctx.pages_crawled}] {ptype}: {link[:50]}...")
-                        except:
-                            pass
+                    time.sleep(0.3)
         
         # Trim lists
         ctx.sample_products = ctx.sample_products[:25]
@@ -551,10 +499,6 @@ class Crawl4AICrawler:
 # =============================================================================
 
 def crawl_site(url: str, max_pages: int = 15, headless: bool = True, progress_callback=None) -> SiteContext:
-    """Crawl a site using Crawl4AI."""
-    crawler = Crawl4AICrawler(max_pages=max_pages, min_pages=5, headless=headless)
+    """Crawl a site using requests (cloud-compatible)."""
+    crawler = Crawl4AICrawler(max_pages=max_pages, min_pages=5)
     return crawler.crawl(url, progress_callback)
-
-
-# Compatibility alias
-PLAYWRIGHT_OK = CRAWL4AI_OK
