@@ -1,0 +1,11 @@
+streamlit
+playwright
+beautifulsoup4
+lxml
+tldextract
+requests
+trafilatura
+google-generativeai
+python-dotenv
+pandas
+tqdm
